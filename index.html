@@ -208,16 +208,14 @@
             }
             /* skills */
             #skillHdr {
-                margin-top: 11px;
-                padding-top: 9px;
-                border-top: 1px solid var(--line);
                 color: var(--ink-dim);
                 text-transform: uppercase;
                 letter-spacing: 0.6px;
                 font-size: 9.5px;
+                margin-bottom: 4px;
             }
             #skillHdr b {
-                color: #5fd0c8;
+                color: #4ade80;
                 font-weight: 600;
             }
             .skill {
@@ -332,79 +330,57 @@
                 text-transform: none;
                 letter-spacing: 0;
             }
-            /* extra top-left pill controls (stacked under the options button) */
-            #skillsBtn,
-            #filterBtn {
+            /* xp bar — always visible, top-right below heat bar */
+            #xpBar {
                 position: fixed;
-                left: 12px;
+                top: 38px;
+                right: 12px;
                 z-index: 11;
-                width: auto;
-                margin: 0;
-                padding: 9px 14px;
-                background: var(--panel);
-                border: 1px solid var(--line);
-                border-radius: 10px;
+                width: 160px;
+                height: 22px;
+                background: #0e1a10cc;
+                border: 1px solid #2a5a30;
+                border-radius: 11px;
+                overflow: hidden;
                 backdrop-filter: blur(8px);
+            }
+            #xpFill {
+                position: absolute;
+                inset: 0;
+                width: 0%;
+                background: linear-gradient(90deg, #166534, #4ade80);
+                transition: width 0.12s ease;
+            }
+            #xpTxt {
+                position: absolute;
+                inset: 0;
+                display: flex;
+                align-items: center;
+                justify-content: center;
                 font-family: ui-monospace, Menlo, monospace;
                 font-size: 11px;
-                letter-spacing: 0.5px;
-                text-transform: uppercase;
-                color: var(--accent);
-                cursor: pointer;
+                letter-spacing: 0.6px;
+                color: #fff;
+                text-shadow: 0 1px 2px #000a;
             }
-            #skillsBtn {
-                top: 56px;
-            }
-            #filterBtn {
-                top: 100px;
-                min-width: 108px;
-            }
-            /* secondary panels share the look of #panel */
+            /* skills panel — always visible, stacked below xpBar on the right */
             #skillsPanel {
                 position: fixed;
-                top: 12px;
-                left: 12px;
+                top: 64px;
+                right: 12px;
                 z-index: 10;
                 background: var(--panel);
                 border: 1px solid var(--line);
                 border-radius: 10px;
-                padding: 12px 13px;
-                width: 236px;
+                padding: 8px 10px;
+                width: 160px;
                 backdrop-filter: blur(8px);
                 font-family: ui-monospace, Menlo, Consolas, monospace;
                 font-size: 11px;
                 line-height: 1.5;
             }
-            #skillsPanel.closed {
-                display: none;
-            }
-            #skillsPanel h1 {
-                font-family: "Iowan Old Style", Georgia, serif;
-                font-weight: 600;
-                font-size: 16px;
-                margin: 0 0 8px;
-                letter-spacing: 0.2px;
-                color: var(--accent);
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-            }
-            #closeSkills {
-                width: 26px;
-                height: 26px;
-                margin: 0;
-                padding: 0;
-                line-height: 1;
-                font-size: 15px;
-                border-radius: 7px;
-                background: #16222b;
-                color: var(--ink-dim);
-                text-transform: none;
-                letter-spacing: 0;
-            }
             @media (max-width: 520px) {
-                #panel,
-                #skillsPanel {
+                #panel {
                     width: 208px;
                     font-size: 10.5px;
                 }
@@ -414,16 +390,13 @@
     <body>
         <canvas id="c"></canvas>
         <button id="menuBtn">☰ options</button>
-        <button id="skillsBtn">Skills</button>
-        <select id="filterBtn" aria-label="Visualization filter">
-            <option value="default">default</option>
-            <option value="endVision">end vision</option>
-            <option value="claimed" selected>claimed</option>
-            <option value="distance">distance</option>
-        </select>
         <div id="heatBar">
             <div id="heatFill"></div>
             <span id="heatTxt">Heat 0 / 6</span>
+        </div>
+        <div id="xpBar">
+            <div id="xpFill"></div>
+            <span id="xpTxt">xp 0 / 5</span>
         </div>
         <div id="panel" class="closed">
             <h1>
@@ -431,6 +404,15 @@
             </h1>
             <p class="sub">a tree that grows where you walk</p>
 
+            <div class="row">
+                <label>Filter</label>
+                <select id="filterBtn" aria-label="Visualization filter">
+                    <option value="default">default</option>
+                    <option value="endVision">end vision</option>
+                    <option value="claimed" selected>claimed</option>
+                    <option value="distance">distance</option>
+                </select>
+            </div>
             <div class="row">
                 <label>Lattice</label>
                 <select id="lattice">
@@ -473,11 +455,8 @@
             </div>
         </div>
 
-        <div id="skillsPanel" class="closed">
-            <h1>Skills <button id="closeSkills" title="Close">×</button></h1>
-            <div id="skillHdr">
-                xp <b id="xpV">0</b> &nbsp;·&nbsp; points <b id="ptV">0</b>
-            </div>
+        <div id="skillsPanel">
+            <div id="skillHdr">pts <b id="ptV">0</b></div>
             <div id="skills"></div>
         </div>
         <div id="hint">
@@ -564,13 +543,13 @@
      [SEC:nearest-site]     nearest traversable site under the finger
      [SEC:movement]         walkPath / stepMove, heat, crystals, remap trigger
      [SEC:input]            pointer: drag-to-route, pan, pinch, wheel
-     [SEC:ui]               options / Skills panels + Filter pill manager
+     [SEC:ui]               options panel + persistent xp bar / skills list
      [SEC:boot]             startup sequence
    Reference tables:
      [REF:site-record]  every field on a site object: meaning / writer / reader
      [REF:globals]      every mutable global and its owning section
      [REF:pipeline]     the mandatory recompute order (do NOT reorder)
-     [REF:effects]      animation effect kinds and the fields each needs
+     [REF:effects]      animation effect kinds (crystalFly/claimFly/shock/sitePulse)
    ============================================================================
    [REF:site-record]   sites is a Map<key, site>; a site is born in ensure().
    ----------------------------------------------------------------------------
@@ -1184,6 +1163,13 @@
                     )
                         ns.unclaimed--;
                 }
+                const wp = L.toPixel(s.c);
+                addEffect({
+                    kind: "claimFly",
+                    world: { x: wp.x, y: wp.y },
+                    depth: s.depth,
+                    dur: 700,
+                });
                 return true;
             }
 
@@ -1614,13 +1600,14 @@
                 if (r.width === 0 && r.height === 0) return null;
                 return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
             }
-            const SKILL_BTN_FALLBACK = { x: 60, y: 73 }; // where the Skills button sits when hidden
+            const SKILL_BTN_FALLBACK = { x: window.innerWidth - 92, y: 49 }; // fallback for xpBar shock ring
 
             /* [REF:effects]  one-off visuals pushed via addEffect(); each needs a case here.
-   kind         fields (besides t0/dur)     drawn as
-   shock        target (button id), delay   expanding ring on a UI button
-   crystalFly   world {x,y}                  diamond arcing from a site to heat bar
-   sitePulse    world {x,y}, color           expanding world-space ring on a site
+   kind         fields (besides t0/dur)          drawn as
+   shock        target (element id), delay        expanding ring on a UI element
+   crystalFly   world {x,y}, targetId             diamond arcing to heat bar or xp bar
+   sitePulse    world {x,y}, color                expanding world-space ring on a site
+   claimFly     world {x,y}, depth                circle (r=2*depth) arcing to xp bar
    Keep effects purely visual -- never mutate game state from drawEffect().      */
             function drawEffect(e, t) {
                 switch (e.kind) {
@@ -1647,10 +1634,10 @@
                         break;
                     }
                     case "crystalFly": {
-                        // diamond arcs from a site up to the heat bar
+                        // diamond arcs from a site up to the heat bar or xp bar
                         const start = worldToScreen(e.world);
                         const bar = document
-                            .getElementById("heatBar")
+                            .getElementById(e.targetId || "heatBar")
                             .getBoundingClientRect();
                         const end = {
                             x: bar.left + bar.width / 2,
@@ -1720,6 +1707,46 @@
                             0,
                             7,
                         );
+                        ctx.stroke();
+                        ctx.restore();
+                        break;
+                    }
+                    case "claimFly": {
+                        // circle arcs from a claimed site up to the xp bar
+                        const start = worldToScreen(e.world);
+                        const bar = document
+                            .getElementById("xpBar")
+                            .getBoundingClientRect();
+                        const end = {
+                            x: bar.left + bar.width / 2,
+                            y: bar.top + bar.height / 2,
+                        };
+                        const ctrl = {
+                            x: (start.x + end.x) / 2,
+                            y: Math.min(start.y, end.y) - 70,
+                        };
+                        const tt = easeInOut(t),
+                            u = 1 - tt;
+                        const x =
+                            u * u * start.x +
+                            2 * u * tt * ctrl.x +
+                            tt * tt * end.x;
+                        const y =
+                            u * u * start.y +
+                            2 * u * tt * ctrl.y +
+                            tt * tt * end.y;
+                        const radius = Math.max(
+                            2,
+                            2 * e.depth * (1 - 0.4 * tt),
+                        );
+                        ctx.save();
+                        ctx.globalAlpha = 1 - t;
+                        ctx.fillStyle = "#4ade80";
+                        ctx.strokeStyle = "#166534";
+                        ctx.lineWidth = 1.5;
+                        ctx.beginPath();
+                        ctx.arc(x, y, radius, 0, Math.PI * 2);
+                        ctx.fill();
                         ctx.stroke();
                         ctx.restore();
                         break;
@@ -1798,7 +1825,7 @@
 
             /* xp / skill-point mutators ------------------------------------------------ */
             /* All xp gains route through addXP so a freshly earned skill point can fire a
-   shockwave exactly once, and the collapsed Skills button label stays current. */
+   shockwave on the xp bar exactly once. */
             function addXP(n) {
                 if (!n) return;
                 const before = availablePoints();
@@ -1808,11 +1835,11 @@
                 updateSkillButton();
             }
             function onPointsGained(count) {
-                const rings = Math.min(count, 4); // cap the burst; the label still shows the true total
+                const rings = Math.min(count, 4);
                 for (let i = 0; i < rings; i++)
                     addEffect({
                         kind: "shock",
-                        target: "skillsBtn",
+                        target: "xpBar",
                         delay: i * 130,
                         dur: 680,
                     });
@@ -2321,13 +2348,15 @@
                 // collect a cooling crystal if present (Healing boosts the recovery)
                 if (ps.crystal) {
                     ps.crystal = false;
+                    const flyToXP = heat === 0;
                     recoverHeat(2 + skills.healing.level);
                     const wp = L.toPixel(ps.c);
                     addEffect({
                         kind: "crystalFly",
                         world: { x: wp.x, y: wp.y },
+                        targetId: flyToXP ? "xpBar" : "heatBar",
                         dur: 560,
-                    }); // fly up to the heat bar
+                    });
                 }
                 // remap when we have moved further than (exploration distance − trigger).
                 // if that is <= 0 (trigger >= distance) every step re-explores.
@@ -2515,11 +2544,10 @@
             );
 
             /* [SEC:ui] ------------------------------------------------------------ ui */
-            /* UI is three mutually-exclusive panels (options / Skills / Filter): each is a
-   top-left button + popover, except Filter which is now a pill-shaped <select>.
-   The Skills button label is set by updateSkillButton() ("Skills" / "Skills
-   (N)"); the Filter control calls setViz() so the change animates -- never
-   assign vizMode here. */
+            /* UI: one collapsible panel (options, top-left button + popover). The XP bar
+   and skills list are always-visible on the right side. The filter select lives
+   inside the options panel and calls setViz() so the change animates -- never
+   assign vizMode directly here. */
             function refreshStats() {
                 let r = 0,
                     md = 0;
@@ -2557,8 +2585,16 @@
             const skillsEl = document.getElementById("skills");
             const skillOrder = ["explore", "pathfind", "healing"];
             function renderSkills() {
+                const n = earnedPoints();
                 const avail = availablePoints();
-                document.getElementById("xpV").textContent = totalXP;
+                let cum = 0;
+                for (let i = 0; i < n; i++) cum += 5 + i * i;
+                const current = totalXP - cum;
+                const nextCost = 5 + n * n;
+                const pct = Math.min(100, (current / nextCost) * 100);
+                document.getElementById("xpFill").style.width = pct + "%";
+                document.getElementById("xpTxt").textContent =
+                    "xp " + current + " / " + nextCost;
                 document.getElementById("ptV").textContent = avail;
                 skillsEl.innerHTML = "";
                 for (const key of skillOrder) {
@@ -2606,13 +2642,12 @@
                 .addEventListener("click", stopMove);
 
             /* collapsible panels: one button per panel, mutually exclusive (closed by
-   default). The filter is a standalone pill/select, but it shares the same
-   top-left stack and hides while a panel is open. */
+   default). Skills and XP are always-visible on the right; only the options
+   panel collapses. */
             const PANELS = {
                 menuBtn: "panel",
-                skillsBtn: "skillsPanel",
             };
-            const BTN_STACK = ["menuBtn", "skillsBtn", "filterBtn"];
+            const BTN_STACK = ["menuBtn"];
             function showButtons(show) {
                 for (const id of BTN_STACK) {
                     const b = document.getElementById(id);
@@ -2635,13 +2670,7 @@
                 .getElementById("menuBtn")
                 .addEventListener("click", () => openPanel("menuBtn"));
             document
-                .getElementById("skillsBtn")
-                .addEventListener("click", () => openPanel("skillsBtn"));
-            document
                 .getElementById("closeBtn")
-                .addEventListener("click", closePanels);
-            document
-                .getElementById("closeSkills")
                 .addEventListener("click", closePanels);
             closePanels();
 
