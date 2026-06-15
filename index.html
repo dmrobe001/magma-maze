@@ -752,11 +752,11 @@
    current origin→star route scorches it for 4 heat the first time, then 1 heat
    on later red revisits. Walking an ungranted site on the route kindles it
    grassy green and adds 1 heat only on its first safe touch. Crystals cool
-   2+Healing heat; any excess cooling becomes XP. Max heat is 5+Healing. */
+   2+Healing heat; any excess cooling becomes XP. Max heat is 5+Healing*2. */
             let heat = 0;
             let stagedXP = 0; // XP progress currently held at the star; 0 if none
             function maxHeat() {
-                return 5 + skills.healing.level;
+                return 5 + skills.healing.level * 2;
             }
             function gainHeat(n) {
                 if (!n) return;
@@ -1098,7 +1098,7 @@
                     if (s.inPatch) continue;
                     s.inPatch = true;
                     newlyVisible.push(k);
-                    if (Math.random() < 1 / 5) s.crystal = true;
+                    if (Math.random() < 1 / 10) s.crystal = true;
                 }
                 scheduleReveal(centerKey, revealKeys, newlyVisible);
 
@@ -1530,7 +1530,7 @@
 
             /* [SEC:generate] ------------------------------------------------ generate */
             function generate() {
-                const INITIAL_PATCH_RADIUS = 5;
+                const INITIAL_PATCH_RADIUS = 3;
                 sites = new Map();
                 mappedCount = 0;
                 // 1) seed path
@@ -2132,7 +2132,9 @@
                         const sb = worldToScreen(b);
                         const otherVisible = visSite(ns, mn);
                         const colorA = siteColour(s, ms);
-                        const colorB = otherVisible ? siteColour(ns, mn) : BLACK;
+                        const colorB = otherVisible
+                            ? siteColour(ns, mn)
+                            : BLACK;
                         const dx = sb.x - sa.x;
                         const dy = sb.y - sa.y;
                         const len = Math.hypot(dx, dy);
@@ -2141,7 +2143,12 @@
                         const holdFrac = hold / len;
                         const blendStart = holdFrac;
                         const blendEnd = 1 - holdFrac;
-                        const grad = ctx.createLinearGradient(sa.x, sa.y, sb.x, sb.y);
+                        const grad = ctx.createLinearGradient(
+                            sa.x,
+                            sa.y,
+                            sb.x,
+                            sb.y,
+                        );
                         grad.addColorStop(0, colorA);
                         grad.addColorStop(blendStart, colorA);
                         grad.addColorStop(blendEnd, colorB);
@@ -2490,7 +2497,30 @@
                 }
                 onStarReached();
                 // claim the site if it's claimable; traversal and claiming are now heat-free.
+                // also attempt claims within path-distance floor(pathfind/3) via passage BFS.
                 claimSite(player);
+                const claimRadius = Math.floor(skills.pathfind.level / 3);
+                if (claimRadius > 0) {
+                    const visited = new Set([player]);
+                    const toVisit = [];
+                    let frontier = [player];
+                    for (let rd = 0; rd < claimRadius; rd++) {
+                        const next = [];
+                        for (const k of frontier)
+                            for (const nk of passKeys(k))
+                                if (!visited.has(nk)) {
+                                    visited.add(nk);
+                                    next.push(nk);
+                                    toVisit.push(nk);
+                                }
+                        frontier = next;
+                    }
+                    toVisit.sort(
+                        (a, b) =>
+                            (S(a).depth ?? Infinity) - (S(b).depth ?? Infinity),
+                    );
+                    for (const k of toVisit) claimSite(k);
+                }
                 updateHeat();
                 // record-breaking path-distance from origin → xp = 3 × the new record
                 const pd = ps.dist;
@@ -2630,15 +2660,21 @@
                     const head = dragPath.length
                         ? dragPath[dragPath.length - 1]
                         : null;
-                    // execute only if released over the site the path actually reaches
-                    if (
-                        curOver !== null &&
-                        curOver === head &&
-                        dragPath.length > 1
-                    ) {
-                        walkPath(dragPath); // pathPlan stays as the highlight during the walk
+                    // walk unless the lift point is more than one lattice site from the path head
+                    if (head !== null && dragPath.length > 1) {
+                        const headPos = L.toPixel(L.unkey(head));
+                        const liftWorld = screenToWorld(e.clientX, e.clientY);
+                        const d = Math.hypot(
+                            liftWorld.x - headPos.x,
+                            liftWorld.y - headPos.y,
+                        );
+                        if (d <= 1.5 * L.spacing) {
+                            walkPath(dragPath); // pathPlan stays as the highlight during the walk
+                        } else {
+                            pathPlan = null; // cancelled: lifted too far from path head
+                        }
                     } else {
-                        pathPlan = null; // cancelled
+                        pathPlan = null;
                     }
                     dragPath = [];
                     curOver = null;
