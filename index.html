@@ -597,7 +597,7 @@
    sequence with heat resets around the first (free) reveal.
    ----------------------------------------------------------------------------
      1. mapPatch(center, radii)   grow tree wide, reveal local sites, maybe spawn crystals
-     2. totalXP += patchCount     +1 per revealed site in the visible patch
+     2. totalXP += patchCount     +1 per first-time-revealed site in the patch
      3. recomputeResolved(...)    flag sites whose every lattice nbr is mapped
      4. propagateDepth(...)       leaf-strip resolved sites -> depth (cascades up)
      5. recomputeProvisional()    estimate prov for the still-unresolved sites
@@ -1065,14 +1065,9 @@
                 }
                 scheduleReveal(centerKey, revealKeys, newlyVisible);
 
-                // xp = every revealed (in-patch) site in the visible patch (re-counts visible overlap too)
-                let xpCount = 0;
-                for (const k of revealKeys) {
-                    if (S(k).inPatch) xpCount++;
-                }
                 return {
                     mapped: [...new Set(newlyMapped)],
-                    patchCount: xpCount,
+                    patchCount: newlyVisible.length, // +1 xp per first-time reveal only
                 };
             }
 
