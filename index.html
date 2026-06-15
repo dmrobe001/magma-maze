@@ -330,11 +330,11 @@
                 text-transform: none;
                 letter-spacing: 0;
             }
-            /* xp bar — always visible, top-right below heat bar */
+            /* xp bar — always visible, top-left below options button */
             #xpBar {
                 position: fixed;
-                top: 38px;
-                right: 12px;
+                top: 56px;
+                left: 12px;
                 z-index: 11;
                 width: 160px;
                 height: 22px;
@@ -363,11 +363,11 @@
                 color: #fff;
                 text-shadow: 0 1px 2px #000a;
             }
-            /* skills panel — always visible, stacked below xpBar on the right */
+            /* skills panel — always visible, stacked below xpBar on the left */
             #skillsPanel {
                 position: fixed;
-                top: 64px;
-                right: 12px;
+                top: 82px;
+                left: 12px;
                 z-index: 10;
                 background: var(--panel);
                 border: 1px solid var(--line);
@@ -580,7 +580,7 @@
    [SEC:world-state]   L (active lattice) | sites (the world Map) | player (key)
                       | lastMapKey (player at last remap) | cfg {radius,
                       revealRadius, trigger, seed, walkLimit, walkRetries}
-   [SEC:skills-xp]     skills{level} | totalXP | heat   (maxHeat via healing)
+   [SEC:skills-xp]     skills{level} | totalXP | heat | stagedXP  (maxHeat via healing)
    [SEC:viz-state]     vizMode | showDbg | originKey | maxDistRecord
    [SEC:site-helpers]  mappedCount
    [SEC:fx]            now (per-frame clock) | effects[] | WAVE_SPEED | waveActive
@@ -588,7 +588,7 @@
    [SEC:star-target]   starKey | starTargetDist | starStepDist
    [SEC:draw]          cv | ctx | DPR | Wd | Hd | cam {x, y, scale}
    [SEC:player-pos]    playerAnim (active tween, or null)
-   [SEC:movement]      moveQueue | moving
+   [SEC:movement]      moveQueue | moving | banished
    [SEC:input]         pointers | mode | pinchStart | pathPlan | dragPath
                        | lastOverSite | curOver
    ============================================================================
@@ -754,12 +754,17 @@
    grassy green and adds 1 heat only on its first safe touch. Crystals cool
    2+Healing heat; any excess cooling becomes XP. Max heat is 5+Healing. */
             let heat = 0;
+            let stagedXP = 0; // XP progress currently held at the star; 0 if none
             function maxHeat() {
                 return 5 + skills.healing.level;
             }
             function gainHeat(n) {
                 if (!n) return;
-                heat = Math.min(maxHeat(), heat + n);
+                if (heat + n > maxHeat()) {
+                    banish();
+                } else {
+                    heat += n;
+                }
             }
             function recoverHeat(n) {
                 if (!n) return;
@@ -767,6 +772,38 @@
                 heat -= cooled;
                 const overflow = n - cooled;
                 if (overflow > 0) addXP(overflow);
+            }
+            /* banish: called when heat would exceed max. Stages the player's current XP
+   progress at the star (old staged XP is permanently lost), resets heat to 0,
+   and teleports the player back to origin. */
+            function banish() {
+                const n = earnedPoints();
+                let cum = 0;
+                for (let i = 0; i < n; i++) cum += 5 + i * i;
+                const progress = totalXP - cum;
+                stagedXP = progress; // overwrites any previously staged XP (it is lost)
+                totalXP -= progress;
+                heat = 0;
+                banished = true;
+                stopMove();
+                if (originKey) {
+                    player = originKey;
+                    playerAnim = null;
+                    growAround(player);
+                    lastMapKey = player;
+                }
+                if (starKey && progress > 0) {
+                    const wp = L.toPixel(S(starKey).c);
+                    addEffect({
+                        kind: "xpFly",
+                        world: { x: wp.x, y: wp.y },
+                        radius: Math.sqrt(progress),
+                        dur: 900,
+                    });
+                }
+                renderSkills();
+                updateHeat();
+                refreshStats();
             }
             function earnedPoints() {
                 let n = 0,
@@ -1470,6 +1507,18 @@
             }
             function onStarReached() {
                 if (!starKey || player !== starKey) return;
+                if (stagedXP > 0) {
+                    // restore XP held at the star; fire a return circle from star to xpBar
+                    const wp = L.toPixel(S(starKey).c);
+                    addEffect({
+                        kind: "xpReturn",
+                        world: { x: wp.x, y: wp.y },
+                        radius: Math.sqrt(stagedXP),
+                        dur: 900,
+                    });
+                    addXP(stagedXP);
+                    stagedXP = 0;
+                }
                 const reached = starKey;
                 const nextTargetDist = starTargetDist + starStepDist;
                 grantPath(bfsPath(originKey, reached), nextTargetDist);
@@ -1516,6 +1565,7 @@
                 lastMapKey = player;
                 originKey = player; // starting point for path-distance modes
                 maxDistRecord = 0;
+                stagedXP = 0;
                 starKey = null;
                 starTargetDist = STAR_START_DIST;
                 starStepDist = STAR_STEP_START;
@@ -1595,7 +1645,7 @@
                 if (r.width === 0 && r.height === 0) return null;
                 return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
             }
-            const SKILL_BTN_FALLBACK = { x: window.innerWidth - 92, y: 49 }; // fallback for xpBar shock ring
+            const SKILL_BTN_FALLBACK = { x: 92, y: 67 }; // fallback for xpBar shock ring (left side)
 
             /* [REF:effects]  one-off visuals pushed via addEffect(); each needs a case here.
    kind         fields (besides t0/dur)          drawn as
@@ -1603,6 +1653,8 @@
    crystalFly   world {x,y}, targetId             diamond arcing to heat bar or xp bar
    sitePulse    world {x,y}, color                expanding world-space ring on a site
    claimFly     world {x,y}, depth                circle (r=2*depth) arcing to xp bar
+   xpFly        world {x,y}, radius               hollow circle from xpBar to star (xp at risk)
+   xpReturn     world {x,y}, radius               filled circle from star to xpBar (xp restored)
    Keep effects purely visual -- never mutate game state from drawEffect().      */
             function drawEffect(e, t) {
                 switch (e.kind) {
@@ -1741,6 +1793,76 @@
                         ctx.lineWidth = 1.5;
                         ctx.beginPath();
                         ctx.arc(x, y, radius, 0, Math.PI * 2);
+                        ctx.fill();
+                        ctx.stroke();
+                        ctx.restore();
+                        break;
+                    }
+                    case "xpFly": {
+                        // hollow circle flies from xpBar to the star (XP at risk)
+                        const barEl = document
+                            .getElementById("xpBar")
+                            .getBoundingClientRect();
+                        const start = {
+                            x: barEl.left + barEl.width / 2,
+                            y: barEl.top + barEl.height / 2,
+                        };
+                        const end = worldToScreen(e.world);
+                        const ctrl = {
+                            x: (start.x + end.x) / 2,
+                            y: Math.min(start.y, end.y) - 80,
+                        };
+                        const tt = easeInOut(t),
+                            u = 1 - tt;
+                        const x =
+                            u * u * start.x +
+                            2 * u * tt * ctrl.x +
+                            tt * tt * end.x;
+                        const y =
+                            u * u * start.y +
+                            2 * u * tt * ctrl.y +
+                            tt * tt * end.y;
+                        ctx.save();
+                        ctx.globalAlpha = 1 - 0.3 * t;
+                        ctx.strokeStyle = "#4ade80";
+                        ctx.lineWidth = 2;
+                        ctx.beginPath();
+                        ctx.arc(x, y, Math.max(3, e.radius), 0, Math.PI * 2);
+                        ctx.stroke();
+                        ctx.restore();
+                        break;
+                    }
+                    case "xpReturn": {
+                        // filled circle flies from star back to xpBar (XP restored)
+                        const start = worldToScreen(e.world);
+                        const barEl = document
+                            .getElementById("xpBar")
+                            .getBoundingClientRect();
+                        const end = {
+                            x: barEl.left + barEl.width / 2,
+                            y: barEl.top + barEl.height / 2,
+                        };
+                        const ctrl = {
+                            x: (start.x + end.x) / 2,
+                            y: Math.min(start.y, end.y) - 80,
+                        };
+                        const tt = easeInOut(t),
+                            u = 1 - tt;
+                        const x =
+                            u * u * start.x +
+                            2 * u * tt * ctrl.x +
+                            tt * tt * end.x;
+                        const y =
+                            u * u * start.y +
+                            2 * u * tt * ctrl.y +
+                            tt * tt * end.y;
+                        ctx.save();
+                        ctx.globalAlpha = 1 - 0.2 * t;
+                        ctx.fillStyle = "#4ade80";
+                        ctx.strokeStyle = "#166534";
+                        ctx.lineWidth = 1.5;
+                        ctx.beginPath();
+                        ctx.arc(x, y, Math.max(3, e.radius), 0, Math.PI * 2);
                         ctx.fill();
                         ctx.stroke();
                         ctx.restore();
@@ -2277,7 +2399,8 @@
 
             /* [SEC:movement] ------------------------------------------------ movement */
             let moveQueue = null,
-                moving = false;
+                moving = false,
+                banished = false; // set by banish(); stepMove aborts current step when true
             function setStop(on) {
                 const sb = document.getElementById("stopBtn"),
                     hint = document.getElementById("hint");
@@ -2325,6 +2448,7 @@
                 return grantEligibleSite(k, starTargetDist);
             }
             function stepMove() {
+                banished = false;
                 if (!moveQueue || !moveQueue.length) {
                     moving = false;
                     moveQueue = null;
@@ -2340,6 +2464,7 @@
                 const ps = S(player);
                 unlockSteppedGrant(player);
                 resolveLandingSite(player);
+                if (banished) return; // banish() took over: player teleported, queue cleared
                 // collect a cooling crystal if present (Healing boosts the recovery)
                 if (ps.crystal) {
                     ps.crystal = false;
@@ -2642,7 +2767,7 @@
             const PANELS = {
                 menuBtn: "panel",
             };
-            const BTN_STACK = ["menuBtn"];
+            const BTN_STACK = ["menuBtn", "xpBar", "skillsPanel"];
             function showButtons(show) {
                 for (const id of BTN_STACK) {
                     const b = document.getElementById(id);
