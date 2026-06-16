@@ -566,8 +566,8 @@
    claimed     claimed for depth^2 xp?                claimSite             colour, rank, visSite
    kindled     walked as safe star-route ground?      stepMove             colour, rank, visSite
    scorched    walked as lava ground?                 stepMove|retarget    colour, rank, visSite
-   dist        tree path-distance from origin         recomputeDistance     colour, rank, stepMove
-   reachEx     is the whole origin->here path seen?   recomputeDistance     colour(distance), rank
+   dist        tree path-distance from origin         extendDistance/..Full colour, rank, stepMove
+   reachEx     is the whole origin->here path seen?   extendDistance/..Full colour(distance), rank
    crystal     does a cooling crystal sit here?       mapPatch | stepMove   draw, stepMove
    unclaimed   # of depth-children not yet claimed    tryAssignDepth|claim  claimSite gate
    ............................................................................
@@ -582,11 +582,13 @@
                       revealRadius, trigger, seed, walkLimit, walkRetries}
    [SEC:skills-xp]     skills{level} | totalXP | heat | stagedXP  (maxHeat via healing)
    [SEC:viz-state]     vizMode | showDbg | originKey | maxDistRecord
-   [SEC:site-helpers]  mappedCount
+   [SEC:site-helpers]  mappedCount | unresolved (mapped sites lacking a depth)
+   [SEC:depth-resolution] resolvedCount | maxDepthSeen (incremental refreshStats stats)
    [SEC:fx]            now (per-frame clock) | effects[] | WAVE_SPEED | waveActive
                        | wavePrev | waveFront | waveMax | waveDist (key -> hop dist)
    [SEC:star-target]   starKey | starTargetDist | starStepDist
    [SEC:draw]          cv | ctx | DPR | Wd | Hd | cam {x, y, scale}
+                       | grid (bucket -> keys) + gridCell (render-cull spatial index)
    [SEC:player-pos]    playerAnim (active tween, or null)
    [SEC:movement]      moveQueue | moving | banished
    [SEC:input]         pointers | mode | pinchStart | pathPlan | dragPath
@@ -601,11 +603,13 @@
      3. recomputeResolved(...)    flag sites whose every lattice nbr is mapped
      4. propagateDepth(...)       leaf-strip resolved sites -> depth (cascades up)
      5. recomputeProvisional()    estimate prov for the still-unresolved sites
-     6. recomputeDistance()       BFS from origin -> dist, reachEx
+     6. extendDistance(new,shown) extend dist/reachEx to new + newly-revealed sites
      7. retarget star if needed   keep the next origin-distance objective live
      8. updateHeat(); renderSkills()
    WHY: step 4 reads the flag from step 3; step 5 seeds off the depths set in
-   step 4 and is discarded as sites resolve; step 6 only needs mapped + pass.
+   step 4 and is discarded as sites resolve; step 6 only needs mapped + pass, and
+   only touches the new/revealed sites (dist is permanent, reachEx monotone) --
+   generate() does the one full recomputeDistanceFull() since origin is fixed.
    The star search reads those distances in step 7, and the UI refresh (8)
    reflects the finished state.
    ============================================================================ */
@@ -934,9 +938,19 @@
                 if (!s.mapped) {
                     s.mapped = true;
                     mappedCount++;
+                    // a freshly mapped site has no resolved depth yet -> it joins the
+                    // unresolved working set that recomputeProvisional() leaf-strips,
+                    // and gets bucketed into the draw-cull spatial index. Both are kept
+                    // incrementally so neither pass has to rescan the whole map.
+                    if (s.depth == null) unresolved.add(k);
+                    gridAdd(k);
                 }
             }
             let mappedCount = 0;
+            // [REF:globals] site-helpers: set of mapped sites that still lack a resolved
+            // depth (== {k : mapped && depth==null}). Maintained by markMapped (add) and
+            // tryAssignDepth (delete); read by recomputeProvisional. Cleared in generate().
+            const unresolved = new Set();
 
             /* [SEC:seed-lerw] ---------------------------------------------- seed LERW */
             function loopErasedWalk(start, steps) {
@@ -1134,11 +1148,18 @@
 
                 return {
                     mapped: [...new Set(newlyMapped)],
+                    revealed: newlyVisible, // inPatch flipped on this round (drives reachEx)
                     patchCount: newlyVisible.length, // +1 xp per first-time reveal only
                 };
             }
 
             /* [SEC:depth-resolution] -------------------------------------- resolution */
+            // [REF:globals] depth-resolution: running stats kept incrementally so
+            // refreshStats() is O(1) instead of scanning every site each remap step.
+            // resolvedCount == #sites with a depth; maxDepthSeen == max assigned depth.
+            // Both only ever grow (depth is permanent); reset in generate().
+            let resolvedCount = 0;
+            let maxDepthSeen = 0;
             /* Writes: site.resolved, site.depth, site.prov, site.unclaimed, site.granted,
    site.claimed,
    totalXP (on claim). Invariant: prov is overwritten the instant a site
@@ -1175,6 +1196,11 @@
                 }
                 if (depthless !== 1) return false;
                 s.depth = anyDepth ? maxd + 1 : 1; // leaf → 1
+                // depth is assigned exactly once and never changes, so we can keep the
+                // "resolved" stats as running counters instead of rescanning every step.
+                unresolved.delete(k);
+                resolvedCount++;
+                if (s.depth > maxDepthSeen) maxDepthSeen = s.depth;
                 // claim bookkeeping: count this node's depth-children (passage neighbours with
                 // smaller depth — all already assigned) that are not yet claimed. A node is
                 // claimable once this hits 0. Tracked incrementally, never rebuilt.
@@ -1241,16 +1267,22 @@
    resolved boundary. This reproduces the spec's "propagate through unresolved
    sites, incrementing depth" and is overwritten the moment a site resolves. */
             function recomputeProvisional() {
+                // U = mapped sites lacking a real depth. Sourced from the incrementally
+                // maintained `unresolved` set rather than scanning every site. The
+                // leaf-strip below is byte-for-byte the same computation as before, so
+                // prov values (hence the H()-gradient the pathfinder climbs) are
+                // identical -- only the O(N) discovery scan is gone.
                 const U = [];
-                for (const [k, s] of sites) {
-                    if (s.mapped && s.depth == null) {
-                        s.prov = null;
-                        U.push(k);
-                    }
+                for (const k of unresolved) {
+                    const s = sites.get(k);
+                    if (!s || !s.mapped || s.depth != null) continue; // defensive
+                    s.prov = null;
+                    U.push(k);
                 }
                 const inU = new Set(U);
                 const remaining = new Map();
                 const queue = [];
+                let qi = 0;
                 for (const k of U) {
                     let c = 0;
                     for (const nk of passKeys(k)) if (inU.has(nk)) c++;
@@ -1258,8 +1290,8 @@
                     if (c <= 1) queue.push(k);
                 }
                 const assigned = new Set();
-                while (queue.length) {
-                    const k = queue.shift();
+                while (qi < queue.length) {
+                    const k = queue[qi++];
                     if (assigned.has(k)) continue;
                     // value from any passage neighbour that already has a value
                     let maxv = 0,
@@ -1289,7 +1321,7 @@
             /* [SEC:grow-round] ------------------------------- per-step PIPELINE */
             /* Order is load-bearing; see [REF:pipeline] near the top of file. */
             /* one growth round: map a patch, award xp, then update resolution + depths */
-            function finalizeMappedGrowth(mappedKeys, allowRetarget) {
+            function finalizeMappedGrowth(mappedKeys, revealedKeys, allowRetarget) {
                 // sites whose resolution may have changed = added ∪ their neighbours
                 const touched = new Set();
                 for (const k of mappedKeys) {
@@ -1300,13 +1332,13 @@
                 const nowResolved = recomputeResolved([...touched]);
                 propagateDepth(nowResolved);
                 recomputeProvisional();
-                recomputeDistance();
+                extendDistance(mappedKeys, revealedKeys);
                 if (allowRetarget && starKey == null) retargetStar();
             }
             function growAround(centerKey) {
                 const res = mapPatch(centerKey, cfg.radius);
                 addXP(res.patchCount); // +1 per site in the visible patch
-                finalizeMappedGrowth(res.mapped, true);
+                finalizeMappedGrowth(res.mapped, res.revealed, true);
                 updateHeat();
                 renderSkills();
             }
@@ -1315,8 +1347,18 @@
             /* Path-distance from the origin over the whole tree (a tree distance, so it is
    permanent once set). In the same pass, mark reachEx = true when every site on
    the origin→site path has been explored (in a patch); distance mode only
-   colours reachEx sites, leaving unexplored-path sites white. */
-            function recomputeDistance() {
+   colours reachEx sites, leaving unexplored-path sites white.
+
+   Two entry points:
+     - recomputeDistanceFull()  rebuilds dist/reachEx for every site. Only needed
+       when the origin (the root) can change -- i.e. once in generate(). O(N).
+     - extendDistance(newMapped, newVisible)  the per-step path. Because the world
+       is one tree that only grows and is rooted at a fixed origin, a site's dist
+       never changes once set; new sites just inherit parent.dist+1. reachEx is
+       monotonic (inPatch only turns on), so a freshly revealed site may switch its
+       branch's reachEx on, cascading to descendants. Cost is O(new + revealed),
+       not O(N) -- this is what keeps movement smooth on a large map. */
+            function recomputeDistanceFull() {
                 for (const [, s] of sites) {
                     s.dist = null;
                     s.reachEx = false;
@@ -1326,8 +1368,9 @@
                 o.dist = 0;
                 o.reachEx = o.inPatch;
                 const q = [originKey];
-                while (q.length) {
-                    const k = q.shift();
+                let qi = 0;
+                while (qi < q.length) {
+                    const k = q[qi++];
                     const s = S(k);
                     for (const nk of passKeys(k)) {
                         const ns = S(nk);
@@ -1335,6 +1378,91 @@
                             ns.dist = s.dist + 1;
                             ns.reachEx = s.reachEx && ns.inPatch;
                             q.push(nk);
+                        }
+                    }
+                }
+            }
+            function extendDistance(newMapped, newVisible) {
+                if (!originKey || !isMapped(originKey)) return;
+                const o = S(originKey);
+                if (o.dist == null) {
+                    o.dist = 0;
+                    o.reachEx = o.inPatch;
+                }
+                // (a) distance any newly mapped, still-distanceless site. Each new site
+                // hangs off the existing (already-distanced) tree, so in a tree its one
+                // distanced passage-neighbour is its parent toward origin: dist=parent+1.
+                // Seed from the boundary sites, then BFS outward through the new subtree.
+                const q = [];
+                let qi = 0;
+                const seed = (k) => {
+                    const s = sites.get(k);
+                    if (!s || !s.mapped || s.dist != null) return;
+                    for (const nk of passKeys(k)) {
+                        const ns = sites.get(nk);
+                        if (ns && ns.dist != null) {
+                            s.dist = ns.dist + 1;
+                            s.reachEx = ns.reachEx && s.inPatch;
+                            q.push(k);
+                            return;
+                        }
+                    }
+                };
+                if (newMapped) for (const k of newMapped) seed(k);
+                q.push(originKey); // covers the very first growth (origin alone distanced)
+                while (qi < q.length) {
+                    const k = q[qi++];
+                    const s = S(k);
+                    const sd = s.dist,
+                        sr = s.reachEx;
+                    for (const nk of passKeys(k)) {
+                        const ns = sites.get(nk);
+                        if (ns && ns.mapped && ns.dist == null) {
+                            ns.dist = sd + 1;
+                            ns.reachEx = sr && ns.inPatch;
+                            q.push(nk);
+                        }
+                    }
+                }
+                // (b) sites revealed this round may flip reachEx on. A site becomes
+                // reachEx once it is inPatch AND its parent is reachEx; that can cascade
+                // down to descendants whose only un-revealed ancestor was this site.
+                if (newVisible && newVisible.length) {
+                    const rq = [];
+                    let ri = 0;
+                    for (const k of newVisible) {
+                        const s = sites.get(k);
+                        if (!s || s.dist == null || s.reachEx || !s.inPatch)
+                            continue;
+                        let parentReach = s.dist === 0;
+                        if (!parentReach) {
+                            for (const nk of passKeys(k)) {
+                                const ns = sites.get(nk);
+                                if (ns && ns.dist === s.dist - 1) {
+                                    parentReach = ns.reachEx;
+                                    break;
+                                }
+                            }
+                        }
+                        if (parentReach) {
+                            s.reachEx = true;
+                            rq.push(k);
+                        }
+                    }
+                    while (ri < rq.length) {
+                        const k = rq[ri++];
+                        const s = S(k);
+                        for (const nk of passKeys(k)) {
+                            const ns = sites.get(nk);
+                            if (
+                                ns &&
+                                ns.dist === s.dist + 1 &&
+                                ns.inPatch &&
+                                !ns.reachEx
+                            ) {
+                                ns.reachEx = true;
+                                rq.push(nk);
+                            }
                         }
                     }
                 }
@@ -1396,14 +1524,14 @@
                 if (!centerKey || !S(centerKey) || !S(centerKey).mapped)
                     return 0;
                 const res = mapPatch(centerKey, radius, -1);
-                finalizeMappedGrowth(res.mapped, false);
+                finalizeMappedGrowth(res.mapped, res.revealed, false);
                 return res.mapped.length;
             }
             function hiddenMapOriginPatch(radius) {
                 if (!originKey || !S(originKey) || !S(originKey).mapped)
                     return 0;
                 const res = mapPatch(originKey, radius, -1);
-                finalizeMappedGrowth(res.mapped, false);
+                finalizeMappedGrowth(res.mapped, res.revealed, false);
                 return res.mapped.length;
             }
             function currentStarPath() {
@@ -1561,6 +1689,12 @@
                 const INITIAL_PATCH_RADIUS = 3;
                 sites = new Map();
                 mappedCount = 0;
+                // reset incrementally maintained state (must precede any markMapped):
+                unresolved.clear();
+                grid.clear();
+                gridCell = Math.max(1, L.spacing * 8); // ~8 lattice steps per bucket
+                resolvedCount = 0;
+                maxDepthSeen = 0;
                 // 1) seed path
                 const path = loopErasedWalk([0, 0], cfg.seed);
                 for (let i = 0; i < path.length; i++) {
@@ -1606,7 +1740,7 @@
                 growAround(player);
                 cfg.radius = liveRadius;
                 cfg.revealRadius = liveRevealRadius;
-                recomputeDistance();
+                recomputeDistanceFull();
                 retargetStar();
                 heat = 0;
                 updateHeat();
@@ -2005,6 +2139,44 @@
                 Wd = 0,
                 Hd = 0;
             let cam = { x: 0, y: 0, scale: 26 };
+            /* [REF:globals] draw: spatial index for the render cull. Every mapped site is
+   bucketed once (in markMapped -> gridAdd) into a world-space cell of `gridCell`
+   units; draw() then visits only the buckets overlapping the viewport instead of
+   the whole `sites` map, so frame cost scales with what is on screen, not the
+   map size. Sites never move (toPixel is fixed per run), so buckets are never
+   rebalanced; the index is cleared/re-sized in generate(). */
+            const grid = new Map(); // "gx,gy" -> array of site keys
+            let gridCell = 8; // world units per bucket (re-set per lattice in generate)
+            function gridAdd(k) {
+                const p = L.toPixel(S(k).c);
+                const bk =
+                    Math.floor(p.x / gridCell) + "," + Math.floor(p.y / gridCell);
+                let arr = grid.get(bk);
+                if (!arr) {
+                    arr = [];
+                    grid.set(bk, arr);
+                }
+                arr.push(k);
+            }
+            // keys of mapped sites whose bucket overlaps the given world rect (a coarse
+            // superset of what is on screen; the per-site bounds test below is the precise
+            // filter). The rect is padded by callers so corridors to just-offscreen
+            // neighbours are still found.
+            function visibleSiteKeys(minX, minY, maxX, maxY) {
+                const out = [];
+                const gx0 = Math.floor(minX / gridCell),
+                    gx1 = Math.floor(maxX / gridCell);
+                const gy0 = Math.floor(minY / gridCell),
+                    gy1 = Math.floor(maxY / gridCell);
+                for (let gx = gx0; gx <= gx1; gx++) {
+                    for (let gy = gy0; gy <= gy1; gy++) {
+                        const arr = grid.get(gx + "," + gy);
+                        if (arr)
+                            for (let i = 0; i < arr.length; i++) out.push(arr[i]);
+                    }
+                }
+                return out;
+            }
             function baseScale() {
                 return Math.max(16, Math.min(Wd, Hd) / (16 * L.spacing));
             }
@@ -2135,6 +2307,16 @@
                     maxX = br.x + pad,
                     minY = tl.y - pad,
                     maxY = br.y + pad;
+                // coarse spatial pre-filter: only sites in buckets overlapping the
+                // viewport (padded one lattice step so corridors to just-offscreen
+                // neighbours are still emitted). The per-site bounds test below is the
+                // precise cull, kept identical so the rendered result is unchanged.
+                const vis = visibleSiteKeys(
+                    minX - L.spacing,
+                    minY - L.spacing,
+                    maxX + L.spacing,
+                    maxY + L.spacing,
+                );
 
                 // pass 1: corridors. A visible endpoint can draw to a hidden passage-neighbour,
                 // treating that hidden endpoint as black. Each corridor holds one endpoint's
@@ -2142,7 +2324,9 @@
                 // holds the other endpoint's colour for the final site-radius.
                 ctx.lineCap = "round";
                 const drawnEdges = new Set();
-                for (const [k, s] of sites) {
+                for (let vi = 0; vi < vis.length; vi++) {
+                    const k = vis[vi];
+                    const s = sites.get(k);
                     const ms = currentModeK(k);
                     if (!visSite(s, ms)) continue;
                     const a = L.toPixel(s.c);
@@ -2190,7 +2374,9 @@
                     }
                 }
                 // pass 2: cells
-                for (const [k, s] of sites) {
+                for (let vi = 0; vi < vis.length; vi++) {
+                    const k = vis[vi];
+                    const s = sites.get(k);
                     const m = currentModeK(k);
                     if (!visSite(s, m)) continue;
                     const a = L.toPixel(s.c);
@@ -2214,7 +2400,9 @@
                 }
 
                 // cooling crystals: icy-blue diamonds on visible sites
-                for (const [k, s] of sites) {
+                for (let vi = 0; vi < vis.length; vi++) {
+                    const k = vis[vi];
+                    const s = sites.get(k);
                     const m = currentModeK(k);
                     if (!s.crystal || !visSite(s, m)) continue;
                     const a = L.toPixel(s.c);
@@ -2389,8 +2577,9 @@
             function bfsPath(a, b) {
                 const prev = new Map([[a, null]]);
                 const q = [a];
-                while (q.length) {
-                    const k = q.shift();
+                let qi = 0;
+                while (qi < q.length) {
+                    const k = q[qi++];
                     if (k === b) {
                         const path = [];
                         let t = b;
@@ -2786,17 +2975,11 @@
    inside the options panel and calls setViz() so the change animates -- never
    assign vizMode directly here. */
             function refreshStats() {
-                let r = 0,
-                    md = 0;
-                for (const [, s] of sites) {
-                    if (s.depth != null) {
-                        r++;
-                        if (s.depth > md) md = s.depth;
-                    }
-                }
+                // resolved count + max depth are maintained incrementally (see
+                // tryAssignDepth); no per-step full-map scan.
                 document.getElementById("sN").textContent = mappedCount;
-                document.getElementById("rN").textContent = r;
-                document.getElementById("dN").textContent = md;
+                document.getElementById("rN").textContent = resolvedCount;
+                document.getElementById("dN").textContent = maxDepthSeen;
             }
             function updateHeat() {
                 const mx = maxHeat();
