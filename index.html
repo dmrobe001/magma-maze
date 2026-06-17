@@ -509,6 +509,7 @@
    - add a mutable global                [REF:globals] (under its owning [SEC])
    - change the per-step recompute order [REF:pipeline]
    - add an animation effect kind        [REF:effects] + a drawEffect() case
+   - add a timing bucket / covariate      [REF:profiler] (+ a line() in Prof._build)
    - change what a section reads/writes,  that section's contract stanza
      or an invariant it must preserve     (its Reads / Writes / Invariant lines)
 
@@ -526,6 +527,7 @@
    ----------------------------------------------------------------------------
      [SEC:lattices]         square / triangular / hexagonal geometry adapters
      [SEC:world-state]      core globals: L, sites, player, lastMapKey, cfg
+     [SEC:profiler]         opt-in frame/step/drag timing + on-canvas overlay
      [SEC:skills-xp]        skills, xp -> points, heat economy
      [SEC:viz-state]        visualization mode + its toggles
      [SEC:site-helpers]     S / ensure / passage + mapped accessors
@@ -550,6 +552,7 @@
      [REF:globals]      every mutable global and its owning section
      [REF:pipeline]     the mandatory recompute order (do NOT reorder)
      [REF:effects]      animation effect kinds (crystalFly/claimFly/shock/sitePulse)
+     [REF:profiler]     timing buckets + covariates (PROFILE/Prof; 'p' overlay)
    ============================================================================
    [REF:site-record]   sites is a Map<key, site>; a site is born in ensure().
    ----------------------------------------------------------------------------
@@ -580,6 +583,8 @@
    [SEC:world-state]   L (active lattice) | sites (the world Map) | player (key)
                       | lastMapKey (player at last remap) | cfg {radius,
                       revealRadius, trigger, seed, walkLimit, walkRetries}
+   [SEC:profiler]      PROFILE (master on/off) | Prof (timing buckets, covariates,
+                      overlay state .shown; see [REF:profiler])
    [SEC:skills-xp]     skills{level} | totalXP | heat | stagedXP  (maxHeat via healing)
    [SEC:viz-state]     vizMode | showDbg | originKey | maxDistRecord
    [SEC:site-helpers]  mappedCount | unresolved (mapped sites lacking a depth)
@@ -589,6 +594,7 @@
    [SEC:star-target]   starKey | starTargetDist | starStepDist
    [SEC:draw]          cv | ctx | DPR | Wd | Hd | cam {x, y, scale}
                        | grid (bucket -> keys) + gridCell (render-cull spatial index)
+                       | _rgbCache | _midCache (corridor colour-blend memo, see midColour)
    [SEC:player-pos]    playerAnim (active tween, or null)
    [SEC:movement]      moveQueue | moving | banished
    [SEC:input]         pointers | mode | pinchStart | pathPlan | dragPath
@@ -612,6 +618,40 @@
    generate() does the one full recomputeDistanceFull() since origin is fixed.
    The star search reads those distances in step 7, and the UI refresh (8)
    reflects the finished state.
+   TIMING: when PROFILE is on, steps 1 and 3-6 are timed into the grow.* buckets
+   (mapPatch | resolved | prov | dist) and the whole remap into step.grow; the
+   grow.* spans also fire for hidden-map premap. See [REF:profiler].
+   ============================================================================
+   [REF:profiler]   Opt-in timing ([SEC:profiler]). PROFILE=false makes every hook
+   a single early-return (overlay + keys go dark). 'p' overlay, 'o' console audit
+   dump), 'c' reset. Each bucket keeps a lifetime tally plus a rolling window
+   (mean/p95/max); watch p95/max for spikes and the per-covariate ratios for
+   growth. Audit closure: the six draw.* phases sum to the frame.* totals
+   (unaccounted = draw self-time: clear + advanceWave). grow.* phases are NOT a
+   clean subset of step.grow -- they also fire for generate() and hidden-map
+   premap, so their lifetime sum is >= step.grow by design.
+   ----------------------------------------------------------------------------
+   BUCKET            ENTRY POINT / SPANS               COVERS
+   frame.idle|pan|   draw() total, by `mode`           one rAF frame, split by the
+     pinch|path                                        interaction in effect
+   draw.cull         screenToWorld x2 + visibleSiteKeys viewport spatial query
+   draw.corridors    pass 1                             edge/corridor strokes
+   draw.cells        pass 2                             site discs (+ debug depth text)
+   draw.crystals     pass 3                             crystal diamonds
+   draw.overlay      route + star + player marker       non-site HUD inside the frame
+   draw.effects      drawEffects()                      transient fx
+   step              stepMove() body                    one traversal step (all of it)
+   step.grow         growAround() at the remap site     the per-step remap spike
+   step.claim        claimSite + claim-radius BFS       claim cascade (scales w/ pathfind)
+   grow.mapPatch     mapPatch()                         wide grow + local reveal
+   grow.resolved     recomputeResolved + propagateDepth pipeline steps 3-4
+   grow.prov         recomputeProvisional()             pipeline step 5
+   grow.dist         extendDistance()                   pipeline step 6
+   drag.connect      connectEntered() per entered site  path-drag pathfinding
+   COVARIATES (last/max/mean): visN (visible sites) | scale (zoom) | siteN (mapped)
+   | patchN | newMapN | unresN (|unresolved|) | dragLen. Normalised health checks:
+   frame ms / visN and step.grow ms / newMapN should stay roughly flat as siteN
+   grows -- upward drift there means a residual O(N) crept back in.
    ============================================================================ */
 
             /* [SEC:lattices] ------------------------------------------------ lattices */
@@ -768,6 +808,148 @@
                 walkLimit: 12500,
                 walkRetries: 8,
             };
+
+            /* [SEC:profiler] ------------------------------------ timing instrumentation */
+            /* Opt-in frame / step / drag timing. The three entry points that actually
+   cost time are timed independently -- they are separate event-loop tasks (the
+   draw() rAF callback, the stepMove() setTimeout step, the connectEntered()
+   path-drag) and so never overlap, which is why "pan while walking" needs no
+   special handling: it is just rAF and timer callbacks interleaving, each timed
+   on its own. Each draw frame's TOTAL is bucketed by interaction cause
+   (frame.idle|pan|pinch|path) while the render PHASES (draw.cull|corridors|cells|
+   crystals|overlay|effects) are cause-independent so their cost is comparable
+   across interactions. Per sample we also log covariates (visible-site count,
+   zoom, map size, patch / new-mapped / unresolved sizes, drag length) so
+   cost-vs-zoom and cost-vs-progress stay visible instead of being averaged away
+   -- the normalised figures (frame ms per visible site, grow ms per new site)
+   are the ones that should stay flat as a session grows if the incremental
+   recompute is doing its job.
+   Each bucket keeps a lifetime tally (the auditable total: phases sum to their
+   parent, unaccounted = parent - Σchildren, surfaced by dump()) plus a rolling
+   window for live mean / p95 / max -- spikes live in p95 and max, which a mean
+   would hide. Surfacing: 'p' toggles the on-canvas overlay, 'o' dumps the audit
+   tree to the console, 'c' resets. Set PROFILE=false to neutralise every hook
+   (each method becomes a single early-return and the overlay + key handler go
+   dark) for a zero-footprint build. Catalogue: [REF:profiler]. */
+            const PROFILE = true;
+            const Prof = (() => {
+                const RING = 256; // rolling-window sample capacity per bucket
+                const buckets = new Map(); // name -> stats
+                const covs = new Map(); // covariate name -> {last,max,sum,n}
+                const order = []; // bucket names, first-seen order (stable overlay)
+                function bk(name) {
+                    let b = buckets.get(name);
+                    if (!b) {
+                        b = { n: 0, sum: 0, max: 0, last: 0,
+                              ring: new Float32Array(RING), ri: 0, rn: 0, rsum: 0 };
+                        buckets.set(name, b);
+                        order.push(name);
+                    }
+                    return b;
+                }
+                function accrue(name, dt) {
+                    const b = bk(name);
+                    b.n++; b.sum += dt; b.last = dt;
+                    if (dt > b.max) b.max = dt;
+                    if (b.rn === RING) b.rsum -= b.ring[b.ri]; else b.rn++;
+                    b.rsum += dt; b.ring[b.ri] = dt; b.ri = (b.ri + 1) % RING;
+                }
+                // zero-alloc nesting stack for sequential / nested phase spans
+                const sName = [], sT = []; let sd = 0;
+                function p95(b) {
+                    if (!b.rn) return 0;
+                    const a = Array.from(b.ring.subarray(0, b.rn)).sort((x, y) => x - y);
+                    return a[Math.min(a.length - 1, Math.floor(a.length * 0.95))];
+                }
+                return {
+                    shown: false,
+                    mark() { return PROFILE ? performance.now() : 0; },
+                    open(name) { if (!PROFILE) return; sName[sd] = name; sT[sd] = performance.now(); sd++; },
+                    close() { if (!PROFILE) return 0; sd--; const dt = performance.now() - sT[sd]; accrue(sName[sd], dt); return dt; },
+                    add(name, t0) { if (!PROFILE) return 0; const dt = performance.now() - t0; accrue(name, dt); return dt; },
+                    frame(t0) { if (!PROFILE) return; accrue("frame." + (mode || "idle"), performance.now() - t0); },
+                    cov(name, v) {
+                        if (!PROFILE) return;
+                        let c = covs.get(name);
+                        if (!c) { c = { last: 0, max: 0, sum: 0, n: 0 }; covs.set(name, c); }
+                        c.last = v; c.sum += v; c.n++; if (v > c.max) c.max = v;
+                    },
+                    reset() { buckets.clear(); covs.clear(); order.length = 0; this._next = 0; },
+                    dump() {
+                        if (!PROFILE) { console.log("PROFILE is off"); return; }
+                        const tot = (n) => buckets.get(n)?.sum || 0;
+                        console.log("=== Prof audit (lifetime) ===");
+                        for (const n of order) {
+                            const b = buckets.get(n);
+                            console.log(
+                                `  ${n.padEnd(15)} n=${String(b.n).padStart(7)} tot=${b.sum.toFixed(1).padStart(9)}ms` +
+                                ` mean=${(b.sum / b.n).toFixed(3)} p95=${p95(b).toFixed(3)} max=${b.max.toFixed(2)}`,
+                            );
+                        }
+                        const frameTot = tot("frame.idle") + tot("frame.pan") + tot("frame.pinch") + tot("frame.path");
+                        const phaseTot = tot("draw.cull") + tot("draw.corridors") + tot("draw.cells") + tot("draw.crystals") + tot("draw.overlay") + tot("draw.effects");
+                        console.log(`  -- draw: frames ${frameTot.toFixed(1)}ms | phases ${phaseTot.toFixed(1)}ms | unaccounted ${(frameTot - phaseTot).toFixed(1)}ms`);
+                        const growTot = tot("step.grow");
+                        const growPhase = tot("grow.mapPatch") + tot("grow.resolved") + tot("grow.prov") + tot("grow.dist");
+                        console.log(`  -- grow: step.grow (remap only) ${growTot.toFixed(1)}ms | all grow phases ${growPhase.toFixed(1)}ms (also counts generate + premap, so >= step.grow)`);
+                        for (const [n, c] of covs)
+                            console.log(`  cov ${n.padEnd(8)} last=${c.last} max=${c.max} mean=${(c.sum / c.n).toFixed(1)}`);
+                    },
+                    overlay(ctx) {
+                        if (!PROFILE || !this.shown) return;
+                        const t = performance.now();
+                        if (!this._next || t >= this._next) { this._next = t + 160; this._lines = this._build(); }
+                        const lines = this._lines || [];
+                        ctx.save();
+                        ctx.font = "11px ui-monospace,monospace";
+                        ctx.textAlign = "left"; ctx.textBaseline = "top";
+                        const pad = 6, lh = 14, w = 330, h = pad * 2 + lh * lines.length;
+                        const x = 8, y = Hd - h - 8; // lower-left corner
+                        ctx.globalAlpha = 0.82; ctx.fillStyle = "#0a0e12";
+                        ctx.fillRect(x, y, w, h);
+                        ctx.globalAlpha = 1; ctx.strokeStyle = "#2b3640";
+                        ctx.strokeRect(x, y, w, h);
+                        for (let i = 0; i < lines.length; i++) {
+                            ctx.fillStyle = lines[i][1];
+                            ctx.fillText(lines[i][0], x + pad, y + pad + i * lh);
+                        }
+                        ctx.restore();
+                    },
+                    _build() {
+                        const out = [];
+                        const c = (s, col) => out.push([s, col || "#cdd6df"]);
+                        const ms = (x) => x.toFixed(2).padStart(6);
+                        const win = (b) => (b.rn ? b.rsum / b.rn : 0);
+                        const line = (label, n) => {
+                            const b = buckets.get(n);
+                            if (!b) return;
+                            c(`${label.padEnd(10)}${ms(win(b))} p95${ms(p95(b))} max${ms(b.max)} n${b.n}`);
+                        };
+                        const cov = (label, n) => {
+                            const x = covs.get(n);
+                            if (x) c(`${label.padEnd(10)}last ${String(x.last).padStart(7)}  max ${String(x.max).padStart(7)}`, "#9aa7b3");
+                        };
+                        c("PROFILER   p hide · o dump · c reset", "#7fd1ff");
+                        c("render / frame (ms)", "#8a98a6");
+                        line("idle", "frame.idle"); line("pan", "frame.pan");
+                        line("pinch", "frame.pinch"); line("drag", "frame.path");
+                        line("·cull", "draw.cull"); line("·corridors", "draw.corridors");
+                        line("·cells", "draw.cells"); line("·crystals", "draw.crystals");
+                        line("·overlay", "draw.overlay"); line("·effects", "draw.effects");
+                        c("step / move (ms)", "#8a98a6");
+                        line("step", "step"); line("·grow", "step.grow"); line("·claim", "step.claim");
+                        line(" mapPatch", "grow.mapPatch"); line(" resolved", "grow.resolved");
+                        line(" prov", "grow.prov"); line(" dist", "grow.dist");
+                        c("drag / enter (ms)", "#8a98a6");
+                        line("connect", "drag.connect");
+                        c("covariates", "#8a98a6");
+                        cov("visible", "visN"); cov("zoom", "scale"); cov("mapped", "siteN");
+                        cov("patch", "patchN"); cov("newMap", "newMapN");
+                        cov("unres", "unresN"); cov("dragLen", "dragLen");
+                        return out;
+                    },
+                };
+            })();
 
             /* [SEC:skills-xp] -------------------------------------------- skills + xp */
             /* XP: +1 per site in the revealed local patch each time a patch is explored
@@ -1329,14 +1511,27 @@
                     for (const nk of nbrKeys(k))
                         if (isMapped(nk)) touched.add(nk);
                 }
+                // [SEC:profiler] the pipeline phases ([REF:pipeline] 3-6); these spans
+                // also fire for hidden-map premap, not just the per-step remap.
+                Prof.open("grow.resolved");
                 const nowResolved = recomputeResolved([...touched]);
                 propagateDepth(nowResolved);
+                Prof.close();
+                Prof.open("grow.prov");
                 recomputeProvisional();
+                Prof.close();
+                Prof.open("grow.dist");
                 extendDistance(mappedKeys, revealedKeys);
+                Prof.close();
+                Prof.cov("newMapN", mappedKeys.length);
+                Prof.cov("unresN", unresolved.size);
                 if (allowRetarget && starKey == null) retargetStar();
             }
             function growAround(centerKey) {
+                Prof.open("grow.mapPatch");
                 const res = mapPatch(centerKey, cfg.radius);
+                Prof.close();
+                Prof.cov("patchN", res.patchCount);
                 addXP(res.patchCount); // +1 per site in the visible patch
                 finalizeMappedGrowth(res.mapped, res.revealed, true);
                 updateHeat();
@@ -2287,7 +2482,63 @@
                 return isSiteShown(s); // revealed only
             }
 
+            /* Corridors normally stroke a 2-colour gradient (endpoint colour held for a
+   site-radius, blended across the middle). That gradient is the single biggest
+   render cost, so we only build one when it is actually visible: same-colour
+   corridors stroke solid, and corridors shorter than BLEND_MIN_PX on-screen
+   stroke a solid midpoint colour (the 50% blend) since the gradient is sub-pixel
+   at that zoom. midColour parses #rgb / #rrggbb / hsl(h,s%,l%) and is doubly
+   memoised -- raw colours in _rgbCache, blended pairs in _midCache -- because only
+   a handful of distinct colours and pairs ever occur. */
+            const BLEND_MIN_PX = 10;
+            const _rgbCache = new Map(); // colour string -> [r,g,b]
+            const _midCache = new Map(); // "a|b" -> midpoint colour string
+            function _hslToRgb(h, s, l) {
+                h = (((h % 360) + 360) % 360) / 360;
+                if (s === 0) { const g = Math.round(l * 255); return [g, g, g]; }
+                const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+                const p = 2 * l - q;
+                const hue = (t) => {
+                    t = ((t % 1) + 1) % 1;
+                    if (t < 1 / 6) return p + (q - p) * 6 * t;
+                    if (t < 1 / 2) return q;
+                    if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
+                    return p;
+                };
+                return [
+                    Math.round(hue(h + 1 / 3) * 255),
+                    Math.round(hue(h) * 255),
+                    Math.round(hue(h - 1 / 3) * 255),
+                ];
+            }
+            function _toRGB(c) {
+                let v = _rgbCache.get(c);
+                if (v) return v;
+                if (c[0] === "#") {
+                    let h = c.slice(1);
+                    if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+                    const n = parseInt(h, 16);
+                    v = [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+                } else {
+                    const m = /hsl\(\s*([\d.]+)\s*,\s*([\d.]+)%\s*,\s*([\d.]+)%/.exec(c);
+                    v = m ? _hslToRgb(+m[1], +m[2] / 100, +m[3] / 100) : [128, 128, 128];
+                }
+                _rgbCache.set(c, v);
+                return v;
+            }
+            function midColour(a, b) {
+                if (a === b) return a;
+                const key = a + "|" + b;
+                let v = _midCache.get(key);
+                if (v) return v;
+                const ra = _toRGB(a), rb = _toRGB(b);
+                v = `rgb(${(ra[0] + rb[0]) >> 1},${(ra[1] + rb[1]) >> 1},${(ra[2] + rb[2]) >> 1})`;
+                _midCache.set(key, v);
+                return v;
+            }
+
             function draw() {
+                const _ft = Prof.mark(); // [SEC:profiler] frame total, bucketed by cause
                 now = performance.now();
                 advanceWave(); // step the filter-transition front
                 ctx.clearRect(0, 0, Wd, Hd);
@@ -2300,6 +2551,7 @@
                 const passW = Math.max(3, sc * 0.6);
 
                 // visible-world bounds (cull)
+                Prof.open("draw.cull");
                 const tl = screenToWorld(0, 0),
                     br = screenToWorld(Wd, Hd);
                 const pad = 2;
@@ -2317,12 +2569,21 @@
                     maxX + L.spacing,
                     maxY + L.spacing,
                 );
+                Prof.close();
+                Prof.cov("visN", vis.length);
+                Prof.cov("scale", Math.round(sc));
+                Prof.cov("siteN", mappedCount);
 
                 // pass 1: corridors. A visible endpoint can draw to a hidden passage-neighbour,
-                // treating that hidden endpoint as black. Each corridor holds one endpoint's
-                // colour for one site-radius, blends linearly across the middle span, then
-                // holds the other endpoint's colour for the final site-radius.
+                // treating that hidden endpoint as black. A corridor holds one endpoint's
+                // colour for one site-radius, blends across the middle, holds the other for
+                // the final site-radius -- but that gradient is only built when the two
+                // endpoint colours differ AND the corridor is at least BLEND_MIN_PX long on
+                // screen; otherwise it strokes solid (endpoint colour, or the midpoint blend
+                // when short). See midColour().
+                Prof.open("draw.corridors");
                 ctx.lineCap = "round";
+                ctx.lineWidth = passW; // constant per frame; set once, not per edge
                 const drawnEdges = new Set();
                 for (let vi = 0; vi < vis.length; vi++) {
                     const k = vis[vi];
@@ -2351,29 +2612,34 @@
                         const dy = sb.y - sa.y;
                         const len = Math.hypot(dx, dy);
                         if (len <= 0) continue;
-                        const hold = Math.min(cellR, len / 2);
-                        const holdFrac = hold / len;
-                        const blendStart = holdFrac;
-                        const blendEnd = 1 - holdFrac;
-                        const grad = ctx.createLinearGradient(
-                            sa.x,
-                            sa.y,
-                            sb.x,
-                            sb.y,
-                        );
-                        grad.addColorStop(0, colorA);
-                        grad.addColorStop(blendStart, colorA);
-                        grad.addColorStop(blendEnd, colorB);
-                        grad.addColorStop(1, colorB);
-                        ctx.strokeStyle = grad;
-                        ctx.lineWidth = passW;
+                        if (colorA === colorB) {
+                            ctx.strokeStyle = colorA; // uniform: no gradient
+                        } else if (len < BLEND_MIN_PX) {
+                            ctx.strokeStyle = midColour(colorA, colorB); // too short to read a blend
+                        } else {
+                            const hold = Math.min(cellR, len / 2);
+                            const holdFrac = hold / len;
+                            const grad = ctx.createLinearGradient(
+                                sa.x,
+                                sa.y,
+                                sb.x,
+                                sb.y,
+                            );
+                            grad.addColorStop(0, colorA);
+                            grad.addColorStop(holdFrac, colorA);
+                            grad.addColorStop(1 - holdFrac, colorB);
+                            grad.addColorStop(1, colorB);
+                            ctx.strokeStyle = grad;
+                        }
                         ctx.beginPath();
                         ctx.moveTo(sa.x, sa.y);
                         ctx.lineTo(sb.x, sb.y);
                         ctx.stroke();
                     }
                 }
+                Prof.close();
                 // pass 2: cells
+                Prof.open("draw.cells");
                 for (let vi = 0; vi < vis.length; vi++) {
                     const k = vis[vi];
                     const s = sites.get(k);
@@ -2400,6 +2666,8 @@
                 }
 
                 // cooling crystals: icy-blue diamonds on visible sites
+                Prof.close();
+                Prof.open("draw.crystals");
                 for (let vi = 0; vi < vis.length; vi++) {
                     const k = vis[vi];
                     const s = sites.get(k);
@@ -2422,8 +2690,10 @@
                     ctx.fill();
                     ctx.stroke();
                 }
+                Prof.close();
 
                 // planned route highlight
+                Prof.open("draw.overlay");
                 if (pathPlan && pathPlan.length) {
                     ctx.strokeStyle = "#ffd23f";
                     ctx.lineWidth = Math.max(2, sc * 0.16);
@@ -2488,9 +2758,14 @@
                 ctx.strokeStyle = "#0c1014";
                 ctx.lineWidth = 2;
                 ctx.stroke();
+                Prof.close();
 
+                Prof.open("draw.effects");
                 drawEffects(); // transient one-off visuals, on top
+                Prof.close();
 
+                Prof.frame(_ft); // attribute whole-frame time to idle/pan/pinch/path
+                Prof.overlay(ctx); // debug HUD (after frame timing so it is not counted)
                 requestAnimationFrame(draw);
             }
 
@@ -2728,6 +3003,7 @@
                     return;
                 }
                 moving = true;
+                const _st = Prof.mark(); // [SEC:profiler] whole-step time
                 const from = L.toPixel(S(player).c);
                 const next = moveQueue.shift();
                 player = next;
@@ -2735,7 +3011,7 @@
                 const ps = S(player);
                 unlockSteppedGrant(player);
                 resolveLandingSite(player);
-                if (banished) return; // banish() took over: player teleported, queue cleared
+                if (banished) { Prof.add("step", _st); return; } // banish() took over: player teleported, queue cleared
                 // collect a cooling crystal if present (Healing boosts the recovery)
                 if (ps.crystal) {
                     ps.crystal = false;
@@ -2755,13 +3031,16 @@
                     b = L.toPixel(S(lastMapKey).c);
                 const dist = Math.hypot(a.x - b.x, a.y - b.y) / L.spacing;
                 if (dist > cfg.trigger) {
+                    const _g = Prof.mark();
                     growAround(player);
+                    Prof.add("step.grow", _g);
                     lastMapKey = player;
                     refreshStats();
                 }
                 onStarReached();
                 // claim the site if it's claimable; traversal and claiming are now heat-free.
                 // also attempt claims within path-distance floor(pathfind/2) via passage BFS.
+                Prof.open("step.claim");
                 claimSite(player);
                 const claimRadius = Math.floor(skills.pathfind.level / 2);
                 if (claimRadius > 0) {
@@ -2785,6 +3064,7 @@
                     );
                     for (const k of toVisit) claimSite(k);
                 }
+                Prof.close();
                 updateHeat();
                 // record-breaking path-distance from origin → xp = 3 × the new record
                 const pd = ps.dist;
@@ -2793,6 +3073,7 @@
                     maxDistRecord = pd;
                 }
                 renderSkills(); // xp may have changed even without a remap
+                Prof.add("step", _st);
                 setTimeout(() => {
                     playerAnim = null;
                     stepMove();
@@ -2911,7 +3192,10 @@
                     if (s !== lastOverSite) {
                         lastOverSite = s;
                         if (s !== null) {
+                            const _d = Prof.mark();
                             connectEntered(s);
+                            Prof.add("drag.connect", _d);
+                            Prof.cov("dragLen", dragPath.length);
                             pathPlan = dragPath.slice();
                         }
                     }
@@ -2968,6 +3252,18 @@
                 },
                 { passive: false },
             );
+            // [SEC:profiler] keyboard controls: p toggles the overlay, o dumps the
+            // lifetime audit tree to the console, c resets. No-ops when PROFILE is off
+            // or when a form control in the options panel has focus.
+            window.addEventListener("keydown", (e) => {
+                if (!PROFILE) return;
+                const tn = e.target && e.target.tagName;
+                if (tn === "INPUT" || tn === "SELECT" || tn === "TEXTAREA") return;
+                const k = e.key.toLowerCase();
+                if (k === "p") Prof.shown = !Prof.shown;
+                else if (k === "o") Prof.dump();
+                else if (k === "c") Prof.reset();
+            });
 
             /* [SEC:ui] ------------------------------------------------------------ ui */
             /* UI: one collapsible panel (options, top-left button + popover). The XP bar
